@@ -94,7 +94,8 @@ def fair_odds_from_prob(prob: float, margin: float = BOOK_MARGIN) -> float:
     return fair * (1.0 - margin)
 
 
-def run_backtest(years: list[int] = None):
+def run_backtest_data(years: list[int] = None, verbose: bool = True) -> list[dict]:
+    """Run walk-forward backtest and return list of prediction dicts."""
     if years is None:
         years = [2018, 2022, 2026]
 
@@ -102,12 +103,10 @@ def run_backtest(years: list[int] = None):
     all_intl = load_international_matches(conn)
     wc_matches = load_wc_matches(conn, years)
 
-    print(f"Backtesting {len(wc_matches)} played World Cup matches across {years}")
-    print(f"International match pool: {len(all_intl)} matches\n")
-
-    # Pre-compute Elo snapshots by processing all matches and storing
-    # the rating state at each unique date boundary.
-    print("Computing Elo snapshots...")
+    if verbose:
+        print(f"Backtesting {len(wc_matches)} played World Cup matches across {years}")
+        print(f"International match pool: {len(all_intl)} matches\n")
+        print("Computing Elo snapshots...")
     elo_snapshots = {}
     elo_state = defaultdict(lambda: ELO_INIT)
     current_date = None
@@ -144,7 +143,8 @@ def run_backtest(years: list[int] = None):
 
     # Get sorted snapshot dates for binary search
     snapshot_dates = sorted(elo_snapshots.keys())
-    print(f"  {len(snapshot_dates)} date snapshots created\n")
+    if verbose:
+        print(f"  {len(snapshot_dates)} date snapshots created\n")
 
     def get_elo_before(match_date: str) -> dict:
         """Get the most recent Elo snapshot before match_date."""
@@ -223,14 +223,22 @@ def run_backtest(years: list[int] = None):
             "log_loss": log_loss_single(outcome_prob),
         })
 
-        if (i + 1) % 20 == 0:
+        if verbose and (i + 1) % 20 == 0:
             print(f"  Processed {i + 1}/{len(wc_matches)} matches...")
 
-    print(f"\n  Completed: {len(results)} predictions\n")
+    if verbose:
+        print(f"\n  Completed: {len(results)} predictions\n")
+
+    conn.close()
+    return results
+
+
+def run_backtest(years: list[int] = None):
+    """Run backtest and print report."""
+    results = run_backtest_data(years)
 
     if not results:
         print("No results to report.")
-        conn.close()
         return
 
     # Overall metrics
@@ -325,7 +333,6 @@ def run_backtest(years: list[int] = None):
               f"{r['p_home']:>4.0%} {r['p_draw']:>4.0%} {r['p_away']:>4.0%} "
               f"{r['p_actual']:>4.0%} {ok}")
 
-    conn.close()
     print("\nDone.")
 
 

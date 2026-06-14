@@ -131,6 +131,9 @@ def ingest_international(conn: sqlite3.Connection):
     # Drop rows with missing team names or scores
     df = df.dropna(subset=["home_team", "away_team", "home_score", "away_score"])
 
+    # Normalize dates to YYYY-MM-DD format
+    df["date"] = pd.to_datetime(df["date"], format="mixed", dayfirst=False).dt.strftime("%Y-%m-%d")
+
     rows = df[["date", "home_team", "away_team", "home_score", "away_score",
                "tournament", "neutral"]].values.tolist()
 

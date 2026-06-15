@@ -22,7 +22,6 @@ from pathlib import Path
 import numpy as np
 
 from model import predict_match, load_ratings, load_global_avg, MAX_GOALS
-from teams import normalize_team
 
 DB_PATH = Path(__file__).resolve().parent.parent / "data" / "worldcup.db"
 

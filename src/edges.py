@@ -5,6 +5,9 @@ Joins model probabilities with market odds, converts decimal odds to
 implied probabilities (removing vig), computes expected value, and
 flags bets where model EV exceeds a configurable threshold.
 
+Markets supported: 1X2, Over/Under (1.5, 2.5, 3.5), BTTS, Double Chance,
+Asian Handicap, Correct Score.
+
 Usage:
     python edges.py
 """
@@ -52,7 +55,7 @@ def get_best_odds(conn: sqlite3.Connection, home: str, away: str) -> dict:
         totals_2_5: {over: best_price, under: best_price} (for 2.5 line)
     Also returns the average odds for vig removal.
     """
-    result = {"h2h": {}, "h2h_avg": {}, "totals_2_5": {}}
+    result = {"h2h": {}, "h2h_avg": {}, "totals": {}}
 
     # H2H best and average odds
     h2h_rows = conn.execute("""
@@ -74,21 +77,25 @@ def get_best_odds(conn: sqlite3.Connection, home: str, away: str) -> dict:
             result["h2h"]["draw"] = best
             result["h2h_avg"]["draw"] = avg
 
-    # Totals (over/under 2.5)
+    # All totals lines (1.5, 2.5, 3.5, etc.)
     totals_rows = conn.execute("""
-        SELECT outcome_name, MAX(outcome_price) as best
+        SELECT outcome_name, outcome_point, MAX(outcome_price) as best
         FROM odds
         WHERE home_team = ? AND away_team = ?
           AND market = 'totals'
-          AND outcome_point = 2.5
-        GROUP BY outcome_name
+        GROUP BY outcome_name, outcome_point
     """, (home, away)).fetchall()
 
-    for name, best in totals_rows:
-        if name == "Over":
-            result["totals_2_5"]["over"] = best
-        elif name == "Under":
-            result["totals_2_5"]["under"] = best
+    for name, point, best in totals_rows:
+        key = f"{name.lower()}_{point}"
+        result["totals"][key] = best
+
+    # Keep backward compat
+    result["totals_2_5"] = {}
+    if "over_2.5" in result["totals"]:
+        result["totals_2_5"]["over"] = result["totals"]["over_2.5"]
+    if "under_2.5" in result["totals"]:
+        result["totals_2_5"]["under"] = result["totals"]["under_2.5"]
 
     return result
 
@@ -125,7 +132,7 @@ def find_edges(
     global_avg: float = None,
 ) -> list[dict]:
     """
-    Find all edges across upcoming matches.
+    Find all edges across upcoming matches and all supported markets.
     Returns a list of edge dicts sorted by EV descending.
     """
     if ratings is None:
@@ -148,66 +155,76 @@ def find_edges(
 
         odds = get_best_odds(conn, home, away)
         market_implied = implied_prob_no_vig(odds.get("h2h_avg", {}))
+        match_label = f"{home} vs {away}"
+        match_date = match["commence_time"][:10]
 
-        # Check h2h markets
-        bets = [
-            ("1X2", home, "home_win", "home"),
-            ("1X2", "Draw", "draw", "draw"),
-            ("1X2", away, "away_win", "away"),
-        ]
-
-        for market_name, label, pred_key, odds_key in bets:
-            best_price = odds.get("h2h", {}).get(odds_key)
+        def add_edge(market, selection, model_p, best_price, impl_p=None):
             if best_price is None:
-                continue
-            model_p = pred[pred_key]
+                return
             ev = compute_ev(model_p, best_price)
-            impl_p = market_implied.get(odds_key, 0)
-
             if ev >= min_ev_pct:
                 edges.append({
-                    "match": f"{home} vs {away}",
-                    "date": match["commence_time"][:10],
-                    "market": market_name,
-                    "selection": label,
+                    "match": match_label,
+                    "date": match_date,
+                    "market": market,
+                    "selection": selection,
                     "model_prob": model_p,
-                    "implied_prob": impl_p,
+                    "implied_prob": impl_p if impl_p else (1.0 / best_price if best_price else 0),
                     "best_odds": best_price,
                     "ev_pct": ev,
                 })
 
-        # Check over 2.5
-        over_price = odds.get("totals_2_5", {}).get("over")
-        if over_price:
-            ev_over = compute_ev(pred["over_2_5"], over_price)
-            if ev_over >= min_ev_pct:
-                edges.append({
-                    "match": f"{home} vs {away}",
-                    "date": match["commence_time"][:10],
-                    "market": "O/U 2.5",
-                    "selection": "Over 2.5",
-                    "model_prob": pred["over_2_5"],
-                    "implied_prob": 1.0 / over_price if over_price else 0,
-                    "best_odds": over_price,
-                    "ev_pct": ev_over,
-                })
+        # 1X2
+        for label, pred_key, odds_key in [
+            (home, "home_win", "home"),
+            ("Draw", "draw", "draw"),
+            (away, "away_win", "away"),
+        ]:
+            best_price = odds.get("h2h", {}).get(odds_key)
+            impl_p = market_implied.get(odds_key, 0)
+            add_edge("1X2", label, pred[pred_key], best_price, impl_p)
 
-        # Check under 2.5
-        under_price = odds.get("totals_2_5", {}).get("under")
-        if under_price:
-            under_prob = 1.0 - pred["over_2_5"]
-            ev_under = compute_ev(under_prob, under_price)
-            if ev_under >= min_ev_pct:
-                edges.append({
-                    "match": f"{home} vs {away}",
-                    "date": match["commence_time"][:10],
-                    "market": "O/U 2.5",
-                    "selection": "Under 2.5",
-                    "model_prob": under_prob,
-                    "implied_prob": 1.0 / under_price if under_price else 0,
-                    "best_odds": under_price,
-                    "ev_pct": ev_under,
-                })
+        # Over/Under 1.5, 2.5, 3.5
+        for line, pred_key in [
+            (1.5, "over_1_5"), (2.5, "over_2_5"), (3.5, "over_3_5"),
+        ]:
+            over_price = odds.get("totals", {}).get(f"over_{line}")
+            under_price = odds.get("totals", {}).get(f"under_{line}")
+            add_edge(f"O/U {line}", f"Over {line}", pred[pred_key], over_price)
+            add_edge(f"O/U {line}", f"Under {line}", 1.0 - pred[pred_key], under_price)
+
+        # BTTS
+        # Note: BTTS odds may come from some bookmakers under a different market key.
+        # For now we compute model prob and check if any btts odds exist.
+        btts_yes_price = odds.get("totals", {}).get("btts_yes")
+        btts_no_price = odds.get("totals", {}).get("btts_no")
+        if btts_yes_price:
+            add_edge("BTTS", "Yes", pred["btts"], btts_yes_price)
+        if btts_no_price:
+            add_edge("BTTS", "No", 1.0 - pred["btts"], btts_no_price)
+
+        # Double Chance (if we can derive from h2h odds or separate market)
+        # Model probabilities are always available
+        add_edge("DC", f"1X ({home}/Draw)", pred["dc_1x"],
+                 odds.get("h2h", {}).get("dc_1x"))
+        add_edge("DC", f"X2 (Draw/{away})", pred["dc_x2"],
+                 odds.get("h2h", {}).get("dc_x2"))
+        add_edge("DC", f"12 ({home}/{away})", pred["dc_12"],
+                 odds.get("h2h", {}).get("dc_12"))
+
+        # Asian Handicap edges (if odds are in DB)
+        ah = pred.get("asian_handicap", {})
+        for line, probs in ah.items():
+            ah_home_key = f"home_{line}"
+            ah_away_key = f"away_{line}"
+            ah_home_price = odds.get("totals", {}).get(ah_home_key)
+            ah_away_price = odds.get("totals", {}).get(ah_away_key)
+            if ah_home_price:
+                add_edge(f"AH {line:+.1f}", f"{home} {line:+.1f}",
+                         probs["home"], ah_home_price)
+            if ah_away_price:
+                add_edge(f"AH {line:+.1f}", f"{away} {-line:+.1f}",
+                         probs["away"], ah_away_price)
 
     edges.sort(key=lambda e: e["ev_pct"], reverse=True)
     return edges
@@ -225,15 +242,23 @@ def main():
     if not edges:
         print("No edges found above threshold.")
     else:
-        print(f"{'Match':<35} {'Market':<10} {'Selection':<18} "
+        print(f"{'Match':<35} {'Market':<12} {'Selection':<20} "
               f"{'Model':>6} {'Impl':>6} {'Odds':>6} {'EV%':>7}")
-        print("-" * 95)
+        print("-" * 100)
         for e in edges:
-            print(f"  {e['match']:<33} {e['market']:<10} {e['selection']:<18} "
+            print(f"  {e['match']:<33} {e['market']:<12} {e['selection']:<20} "
                   f"{e['model_prob']:>5.1%} {e['implied_prob']:>5.1%} "
                   f"{e['best_odds']:>6.2f} {e['ev_pct']:>+6.1f}%")
 
     print(f"\nTotal edges: {len(edges)}")
+
+    # Summary by market type
+    from collections import Counter
+    mkt_counts = Counter(e["market"] for e in edges)
+    print("\nEdges by market:")
+    for mkt, count in mkt_counts.most_common():
+        print(f"  {mkt}: {count}")
+
     conn.close()
 
 

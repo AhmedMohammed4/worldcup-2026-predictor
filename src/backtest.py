@@ -21,6 +21,7 @@ import numpy as np
 from ratings import (
     compute_elo,
     compute_attack_defense,
+    compute_form,
     ELO_INIT,
     HISTORY_START,
 )
@@ -40,8 +41,15 @@ def get_db() -> sqlite3.Connection:
     return conn
 
 
-def load_international_matches(conn: sqlite3.Connection) -> list[tuple]:
+def load_international_matches(conn: sqlite3.Connection, with_tournament: bool = False) -> list[tuple]:
     """Load all international matches sorted by date."""
+    if with_tournament:
+        return conn.execute("""
+            SELECT date, home_team, away_team, home_goals, away_goals, neutral, tournament
+            FROM international_matches
+            WHERE home_goals IS NOT NULL AND away_goals IS NOT NULL
+            ORDER BY date
+        """).fetchall()
     return conn.execute("""
         SELECT date, home_team, away_team, home_goals, away_goals, neutral
         FROM international_matches
@@ -101,6 +109,7 @@ def run_backtest_data(years: list[int] = None, verbose: bool = True) -> list[dic
 
     conn = get_db()
     all_intl = load_international_matches(conn)
+    all_intl_tourn = load_international_matches(conn, with_tournament=True)
     wc_matches = load_wc_matches(conn, years)
 
     if verbose:
@@ -162,8 +171,9 @@ def run_backtest_data(years: list[int] = None, verbose: bool = True) -> list[dic
         # Get Elo ratings as of before this match
         elo = get_elo_before(match_date)
 
-        # Get attack/defense from international matches before this date
-        prior_intl = [x for x in all_intl if x[0] < match_date and x[0] >= HISTORY_START]
+        # Get attack/defense from international matches before this date (with tournament weighting)
+        ref_date = datetime.strptime(match_date, "%Y-%m-%d").date()
+        prior_intl = [x for x in all_intl_tourn if x[0] < match_date and x[0] >= HISTORY_START]
 
         if len(prior_intl) < 100:
             # Not enough data, skip
@@ -171,8 +181,11 @@ def run_backtest_data(years: list[int] = None, verbose: bool = True) -> list[dic
 
         attack, defense, global_avg = compute_attack_defense(
             prior_intl,
-            reference_date=datetime.strptime(match_date, "%Y-%m-%d").date(),
+            reference_date=ref_date,
         )
+
+        # Compute form
+        form = compute_form(prior_intl, reference_date=ref_date)
 
         # Build ratings dict for model
         ratings = {}
@@ -181,6 +194,7 @@ def run_backtest_data(years: list[int] = None, verbose: bool = True) -> list[dic
                 "elo": elo.get(team, ELO_INIT),
                 "attack": attack.get(team, 1.0),
                 "defense": defense.get(team, 1.0),
+                "form": form.get(team, 1.0),
             }
 
         try:
